@@ -1,67 +1,72 @@
-import torch
-import chess
-import json
-import os
-import numpy as np
-from models import PolicyNet
-from dataset import FenMoveDataset
+"""CLI utility for generating move predictions from a trained policy network."""
 
-def fen_to_planes(fen: str):
-    board = chess.Board(fen)
-    planes = []
-    piece_types = [chess.PAWN,chess.KNIGHT,chess.BISHOP,
-                   chess.ROOK,chess.QUEEN,chess.KING]
-    for color in [chess.WHITE, chess.BLACK]:
-        for pt in piece_types:
-            m = np.zeros((8,8), dtype=np.float32)
-            for sq in board.pieces(pt, color):
-                r,c = divmod(63 - sq, 8)
-                m[r,c] = 1.0
-            planes.append(m)
-    # side to move
-    planes.append(np.full((8,8), 1.0 if board.turn==chess.WHITE else 0.0, dtype=np.float32))
-    # castling rights
-    wk = np.full((8,8), board.has_kingside_castling_rights(chess.WHITE), dtype=np.float32)
-    wq = np.full((8,8), board.has_queenside_castling_rights(chess.WHITE), dtype=np.float32)
-    bk = np.full((8,8), board.has_kingside_castling_rights(chess.BLACK), dtype=np.float32)
-    bq = np.full((8,8), board.has_queenside_castling_rights(chess.BLACK), dtype=np.float32)
-    planes += [wk,wq,bk,bq]
-    # en passant
-    ep = np.zeros((8,8), dtype=np.float32)
-    if board.ep_square is not None:
-        r,c = divmod(63 - board.ep_square, 8)
-        ep[r,c] = 1.0
-    planes.append(ep)
-    return np.stack(planes, axis=0)
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+from typing import Dict, List
+
+import torch
+
+from .features import fen_to_planes, legal_move_mask, mask_logits
+from .models import PolicyNet
+
 
 @torch.no_grad()
-def predict_move(fen: str, model, move2id, device, topk=5):
+def predict_move(
+    fen: str,
+    model: PolicyNet,
+    move2id: Dict[str, int],
+    device: torch.device,
+    topk: int = 5,
+) -> List[str]:
+    """Return the top-k legal moves for the given FEN using the provided model."""
     model.eval()
-    x = fen_to_planes(fen)
-    x = torch.from_numpy(x).unsqueeze(0).float().to(device)
-    with torch.amp.autocast("cuda", enabled=(device=="cuda")):
-        logits = model(x)
-    # lọc theo legal
-    board = chess.Board(fen)
-    ids = [move2id[m.uci()] for m in board.legal_moves if m.uci() in move2id]
-    li = logits[0, ids]
-    k = min(topk, len(ids))
-    idx = torch.topk(li, k=k).indices.cpu().tolist()
-    inv_vocab = {v:k for k,v in move2id.items()}
-    return [inv_vocab[ids[i]] for i in idx]
+    planes, board = fen_to_planes(fen)
+    inputs = torch.from_numpy(planes).unsqueeze(0).float().to(device)
+    legal_mask = torch.from_numpy(legal_move_mask(board, move2id)).unsqueeze(0).to(device)
 
-if __name__ == "__main__":
-    # Load model
-    ckpt_path = "models/policy_model.pt"
-    checkpoint = torch.load(ckpt_path)
+    with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
+        logits = model(inputs)
+        masked_logits = mask_logits(logits, legal_mask)
+
+    probabilities = torch.softmax(masked_logits, dim=-1)
+    legal_moves_available = int(legal_mask.sum().item())
+    k = min(topk, legal_moves_available) if legal_moves_available > 0 else 0
+    top_indices = torch.topk(probabilities, k=k, dim=-1).indices[0].tolist() if k > 0 else []
+
+    id2move = {idx: move for move, idx in move2id.items()}
+    return [id2move[i] for i in top_indices]
+
+
+def load_checkpoint(path: Path, device: torch.device):
+    """Load a saved policy checkpoint from disk."""
+    return torch.load(path, map_location=device)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Predict chess moves from a trained policy network.")
+    parser.add_argument("--checkpoint", type=Path, default=Path("models/policy_model.pt"))
+    parser.add_argument(
+        "--fen",
+        type=str,
+        default="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        help="FEN position to evaluate.",
+    )
+    parser.add_argument("--topk", type=int, default=5, help="Number of candidate moves to return.")
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    checkpoint = load_checkpoint(args.checkpoint, device)
     move2id = checkpoint["vocab"]
-    vocab_size = len(move2id)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = PolicyNet(vocab_size)
+
+    model = PolicyNet(len(move2id))
     model.load_state_dict(checkpoint["model_state"])
     model.to(device)
 
-    # Example prediction
-    fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
-    predictions = predict_move(fen, model, move2id, device, topk=5)
-    print(f"Predicted moves for starting position: {predictions}")
+    moves = predict_move(args.fen, model, move2id, device, topk=args.topk)
+    print(f"Top-{len(moves)} moves: {moves}")
+
+
+if __name__ == "__main__":
+    main()

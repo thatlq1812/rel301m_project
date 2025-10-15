@@ -1,12 +1,29 @@
-import os
-import json
+"""
+Dataset cleaning and splitting helpers.
+"""
 
-def clean_dataset(data_path: str, out_file: str):
+from __future__ import annotations
+
+import json
+import random
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+
+def clean_dataset(data_path: str | Path, out_file: str | Path) -> Tuple[int, int]:
+    """
+    Remove duplicate (fen, move, side_to_move) triples from the dataset.
+
+    Returns:
+        Tuple[int, int]: number of kept samples, number of removed samples.
+    """
+    data_path = Path(data_path)
+    out_file = Path(out_file)
     seen = set()
     kept = 0
     removed = 0
 
-    with open(data_path, "r") as fin, open(out_file, "w") as fout:
+    with data_path.open("r", encoding="utf-8") as fin, out_file.open("w", encoding="utf-8") as fout:
         for line in fin:
             obj = json.loads(line)
             key = (obj["fen"], obj["move"], obj["side_to_move"])
@@ -17,53 +34,51 @@ def clean_dataset(data_path: str, out_file: str):
             kept += 1
             fout.write(json.dumps(obj) + "\n")
 
-    print(f"Saved cleaned dataset: {out_file}")
-    print(f"Kept: {kept}, Removed: {removed}, Total: {kept+removed}")
+    print(f"[clean_split] wrote cleaned dataset to {out_file} (kept={kept}, removed={removed})")
     return kept, removed
 
-import random
-from typing import List, Dict, Any
 
 def split_jsonl_dataset(
-    in_file: str,
-    out_dir: str,
+    in_file: str | Path,
+    out_dir: str | Path,
     seed: int = 42,
     train_ratio: float = 0.8,
     val_ratio: float = 0.1,
 ) -> None:
+    """Shuffle and split a JSONL dataset into train/val/test partitions."""
+    in_file = Path(in_file)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    with open(in_file, "r", encoding="utf-8") as f:
-        data: List[Dict[str, Any]] = [json.loads(line) for line in f]
+    with in_file.open("r", encoding="utf-8") as fin:
+        data: List[Dict[str, Any]] = [json.loads(line) for line in fin]
 
     random.seed(seed)
     random.shuffle(data)
 
     n = len(data)
     n_train = int(train_ratio * n)
-    n_val   = int(val_ratio * n)
+    n_val = int(val_ratio * n)
 
     splits = {
         "train.jsonl": data[:n_train],
-        "val.jsonl":   data[n_train:n_train + n_val],
-        "test.jsonl":  data[n_train + n_val:],
+        "val.jsonl": data[n_train : n_train + n_val],
+        "test.jsonl": data[n_train + n_val :],
     }
 
-    os.makedirs(out_dir, exist_ok=True)
     for name, subset in splits.items():
-        path = os.path.join(out_dir, name)
-        with open(path, "w", encoding="utf-8") as f:
+        path = out_dir / name
+        with path.open("w", encoding="utf-8") as fout:
             for obj in subset:
-                f.write(json.dumps(obj, ensure_ascii=False) + "\n")
-        print(f"Saved {name}: {len(subset)} samples")
+                fout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        print(f"[clean_split] {name}: {len(subset)} samples -> {path}")
+
 
 if __name__ == "__main__":
-    data_path = "data/working/move_dataset.jsonl"
-    out_dir = "data/working"
-    
-    if not os.path.exists(data_path):
-        print(f"Error: Input file {data_path} does not exist. Please run data processing first.")
-        exit(1)
-    
-    clean_file = os.path.join(out_dir, "move_dataset_clean.jsonl")
-    kept, removed = clean_dataset(data_path, clean_file)
+    data_path = Path("data/working/move_dataset.jsonl")
+    out_dir = Path("data/working")
+    if not data_path.exists():
+        raise SystemExit(f"Input file {data_path} does not exist. Run data_processing first.")
+    clean_file = out_dir / "move_dataset_clean.jsonl"
+    clean_dataset(data_path, clean_file)
     split_jsonl_dataset(clean_file, out_dir)

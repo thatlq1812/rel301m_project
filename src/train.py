@@ -1,133 +1,237 @@
-import os
+"""
+Supervised imitation learning stage for the chess policy network.
+
+This script trains a policy model to imitate expert moves extracted from PGN
+data. The resulting checkpoint can then be fine-tuned via reinforcement
+learning in the RL pipeline.
+"""
+
+from __future__ import annotations
+
+import argparse
 import json
-import numpy as np
+import math
+from pathlib import Path
+from typing import Dict
+
 import torch
-import chess
-from torch.utils.data import Dataset, DataLoader
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
-import math
+from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
-from dataset import FenMoveDataset, collate_fn
-from models import PolicyNet, ChessResNet
+from .dataset import FenMoveDataset, collate_fn
+from .features import mask_logits
+from .models import PolicyNet
+
 
 class MaskedCrossEntropyLoss(nn.Module):
-    def forward(self, logits, target, legal_mask):
-        masked_logits = logits.masked_fill(legal_mask==0, float("-inf"))
+    """Cross-entropy loss that ignores illegal moves by masking logits."""
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor, legal_mask: torch.Tensor) -> torch.Tensor:
+        masked_logits = mask_logits(logits, legal_mask)
         log_probs = F.log_softmax(masked_logits, dim=-1)
-        B,V = logits.shape
-        idx = torch.arange(B, device=logits.device)
-        valid = (target >= 0) & (target < V)
-        tgt_logp = log_probs[idx, target]
-        tgt_logp[~valid] = 0.0
-        if valid.any():
-            return -(tgt_logp[valid].mean())
-        else:
-            return torch.tensor(0.0, device=logits.device)
+        batch, vocab = logits.shape
+        indices = torch.arange(batch, device=logits.device)
+        valid = (targets >= 0) & (targets < vocab)
+        selected = log_probs[indices, targets.clamp(min=0)]
+        selected = torch.where(valid, selected, torch.zeros_like(selected))
+        return -selected[valid].mean() if valid.any() else torch.zeros((), device=logits.device)
 
-class Trainer:
-    def __init__(self, model, train_dl, val_dl, device="cpu", lr=1e-3):
+
+class SupervisedTrainer:
+    """Encapsulates the imitation learning training loop."""
+
+    def __init__(
+        self,
+        model: PolicyNet,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        device: torch.device,
+        lr: float = 1e-3,
+    ) -> None:
         self.model = model.to(device)
-        self.train_dl = train_dl
-        self.val_dl = val_dl
+        self.train_loader = train_loader
+        self.val_loader = val_loader
         self.device = device
-        self.opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+        self.optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
         self.criterion = MaskedCrossEntropyLoss()
+        self.scaler = GradScaler(enabled=device.type == "cuda")
 
-    def run_epoch(self, train=True):
+    def _run_epoch(self, train: bool = True) -> float:
+        loader = self.train_loader if train else self.val_loader
         self.model.train(train)
-        total_loss, total = 0.0, 0
-        with torch.set_grad_enabled(train):
-            for X,y,mask in self.train_dl if train else self.val_dl:
-                X,y,mask = X.to(self.device), y.to(self.device), mask.to(self.device)
-                logits = self.model(X)
-                loss = self.criterion(logits, y, mask)
-                if train:
-                    self.opt.zero_grad()
-                    loss.backward()
-                    self.opt.step()
-                bs = X.size(0)
-                total_loss += loss.item() * bs
-                total += bs
-        return total_loss / max(total,1)
+        epoch_loss, total_samples = 0.0, 0
 
-    def fit(self, epochs=5):
-        for ep in range(epochs):
-            tr = self.run_epoch(True)
-            va = self.run_epoch(False)
-            print(f"Epoch {ep}: train {tr:.4f} | val {va:.4f}")
+        for planes, targets, legal_mask in tqdm(loader, leave=False, desc="train" if train else "valid"):
+            planes = planes.to(self.device, non_blocking=True)
+            targets = targets.to(self.device, non_blocking=True)
+            legal_mask = legal_mask.to(self.device, non_blocking=True)
 
-def masked_ce(logits, targets, legal, label_smoothing=0.05):
-    masked = torch.full_like(logits, float("-inf"))
-    for i, ids in enumerate(legal):
-        if ids: masked[i, ids] = logits[i, ids]
-        else:   masked[i] = logits[i]
-    return F.cross_entropy(masked, targets, label_smoothing=label_smoothing)
+            with torch.set_grad_enabled(train), autocast(device_type=self.device.type, enabled=self.device.type == "cuda"):
+                logits = self.model(planes)
+                loss = self.criterion(logits, targets, legal_mask)
 
-def evaluate(model, val_dl, device):
+            batch_size = planes.size(0)
+            epoch_loss += loss.item() * batch_size
+            total_samples += batch_size
+
+            if train:
+                self.optimizer.zero_grad(set_to_none=True)
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+
+        return epoch_loss / max(1, total_samples)
+
+    def fit(self, epochs: int = 10) -> None:
+        for epoch in range(1, epochs + 1):
+            train_loss = self._run_epoch(train=True)
+            val_loss = self._run_epoch(train=False)
+            print(f"[Epoch {epoch:03d}] train_loss={train_loss:.4f} | val_loss={val_loss:.4f}")
+
+
+@torch.no_grad()
+def evaluate(model: PolicyNet, data_loader: DataLoader, device: torch.device) -> Dict[str, float]:
+    """
+    Evaluate the model on a validation dataloader, returning loss and accuracy
+    metrics (top-1/top-3) under legality constraints.
+    """
     model.eval()
-    tot_loss=n=0; top1=top3=0
-    for xb, yb, legal in val_dl:
-        xb, yb = xb.to(device), yb.to(device)
+    total_loss = total_samples = top1 = top3 = 0
 
-        safe_y = yb.clone()
-        for i,(yi,L) in enumerate(zip(yb.tolist(), legal)):
-            if (yi<0) or (yi not in L):
-                safe_y[i] = torch.tensor(L[0] if L else 0, device=device)
+    criterion = MaskedCrossEntropyLoss()
 
-        with autocast("cuda", enabled=(device=="cuda")):
-            logits = model(xb)
-            loss = masked_ce(logits, safe_y, legal, label_smoothing=0.05)
+    for planes, targets, legal_mask in data_loader:
+        planes = planes.to(device)
+        targets = targets.to(device)
+        legal_mask = legal_mask.to(device)
 
-        B = xb.size(0); tot_loss += float(loss)*B; n += B
+        with autocast(device_type=device.type, enabled=device.type == "cuda"):
+            logits = model(planes)
+            loss = criterion(logits, targets, legal_mask)
 
-        for i in range(B):
-            ids = legal[i] if legal[i] else torch.arange(logits.size(1)).tolist()
-            li = logits[i, ids]
-            k = min(3, len(ids))
-            topk = torch.topk(li, k=k).indices.cpu().tolist()
-            pred1 = ids[topk[0]]; gold = int(safe_y[i])
-            if pred1==gold: top1+=1
-            if gold in [ids[j] for j in topk]: top3+=1
+        batch = planes.size(0)
+        total_loss += loss.item() * batch
+        total_samples += batch
 
-    loss = tot_loss/max(1,n); ppl = math.exp(min(20,loss))
-    return {"val_loss":loss, "val_ppl":ppl, "val_top1":top1/n, "val_top3":top3/n}
+        masked_logits = mask_logits(logits, legal_mask)
+        probs = torch.softmax(masked_logits, dim=-1)
+        topk = torch.topk(probs, k=3, dim=-1).indices
+
+        gold = targets.unsqueeze(-1)
+        top1 += (topk[:, 0:1] == gold).any(dim=-1).sum().item()
+        top3 += (topk == gold).any(dim=-1).sum().item()
+
+    mean_loss = total_loss / max(1, total_samples)
+    perplexity = math.exp(min(20.0, mean_loss))
+    return {
+        "loss": mean_loss,
+        "perplexity": perplexity,
+        "top1": top1 / max(1, total_samples),
+        "top3": top3 / max(1, total_samples),
+    }
+
+
+def load_vocab(path: Path) -> Dict[str, int]:
+    with path.open("r", encoding="utf-8") as file:
+        return json.load(file)
+
+
+def build_dataloaders(workdir: Path, vocab: Dict[str, int], batch_size: int = 256, num_workers: int = 2):
+    train_ds = FenMoveDataset(workdir / "train.jsonl", vocab)
+    val_ds = FenMoveDataset(workdir / "val.jsonl", vocab)
+    pin_memory = torch.cuda.is_available()
+    train_dl = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+        pin_memory=pin_memory,
+    )
+    val_dl = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+        pin_memory=pin_memory,
+    )
+    return train_dl, val_dl
+
+
+def save_checkpoint(model: PolicyNet, optimizer: torch.optim.Optimizer, vocab: Dict[str, int], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "vocab": vocab,
+        },
+        path,
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Supervised pre-training of the chess policy network.")
+    parser.add_argument("--workdir", type=Path, default=Path("data/working"))
+    parser.add_argument("--vocab", type=Path, default=Path("data/working/move_vocab_4672.json"))
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--checkpoint", type=Path, default=Path("models/policy_model.pt"))
+    parser.add_argument("--resume", type=Path, help="Optional checkpoint to resume from.")
+    return parser.parse_args()
+
+
+def run_supervised_training(
+    workdir: Path,
+    vocab_path: Path,
+    checkpoint_path: Path,
+    epochs: int = 30,
+    batch_size: int = 256,
+    lr: float = 1e-3,
+    num_workers: int = 2,
+    resume: Path | None = None,
+) -> Dict[str, float]:
+    vocab = load_vocab(vocab_path)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    train_loader, val_loader = build_dataloaders(workdir, vocab, batch_size=batch_size, num_workers=num_workers)
+
+    model = PolicyNet(len(vocab))
+
+    trainer = SupervisedTrainer(model, train_loader, val_loader, device=device, lr=lr)
+
+    if resume:
+        checkpoint = torch.load(resume, map_location=device)
+        model.load_state_dict(checkpoint["model_state"])
+        trainer.optimizer.load_state_dict(checkpoint["optimizer_state"])
+        print(f"Resumed from checkpoint {resume}")
+
+    trainer.fit(epochs=epochs)
+
+    save_checkpoint(trainer.model, trainer.optimizer, vocab, checkpoint_path)
+    metrics = evaluate(trainer.model, val_loader, device)
+    print(f"Validation metrics after training: {metrics}")
+    return metrics
+
+
+def main():
+    args = parse_args()
+    run_supervised_training(
+        workdir=args.workdir,
+        vocab_path=args.vocab,
+        checkpoint_path=args.checkpoint,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        num_workers=args.num_workers,
+        resume=args.resume,
+    )
+
 
 if __name__ == "__main__":
-    workdir = "data/working"
-    train_path = os.path.join(workdir, "train.jsonl")
-    val_path   = os.path.join(workdir, "val.jsonl")
-    vocab_path = os.path.join(workdir, "move_vocab_4672.json")
-
-    # Load vocab
-    with open(vocab_path, "r") as f:
-        move2id = json.load(f)
-    vocab_size = len(move2id)
-    print(f"Loaded vocab size = {vocab_size}")
-
-    # Dataset + DataLoader
-    train_ds = FenMoveDataset(train_path, move2id)
-    val_ds   = FenMoveDataset(val_path, move2id)
-
-    train_dl = DataLoader(train_ds, batch_size=256, shuffle=True, num_workers=2, collate_fn=collate_fn)
-    val_dl   = DataLoader(val_ds, batch_size=256, shuffle=False, num_workers=2, collate_fn=collate_fn)
-
-    # Model + Trainer
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = PolicyNet(vocab_size)
-    trainer = Trainer(model, train_dl, val_dl, device=device, lr=1e-3)
-
-    # Train
-    trainer.fit(epochs=30)
-
-    # Save model checkpoint
-    ckpt_path = "models/policy_model.pt"
-    os.makedirs("models", exist_ok=True)
-    torch.save({
-        "model_state": model.state_dict(),
-        "optimizer_state": trainer.opt.state_dict(),
-        "vocab": move2id
-    }, ckpt_path)
-
-    print(f"Model saved to {ckpt_path}")
+    main()

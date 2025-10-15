@@ -1,65 +1,75 @@
-import bz2
-import io
-import re
+"""
+Utilities for transforming raw PGN data into (FEN, move) training examples.
+"""
+
+from __future__ import annotations
+
 import json
-import os
+from pathlib import Path
+from typing import Optional
+
 import chess
 import chess.pgn
+from tqdm.auto import tqdm
 
-EVAL_RE = re.compile(r"\[%eval\s+([+#\-0-9\.]+)\]")
 
-def extract_moves_from_pgn(path_in: str, path_out: str, limit=None):
-    # First, load and filter games with eval like in the notebook
-    print("Loading and filtering games with eval...")
-    with open(path_in, "r", encoding="utf-8", errors="ignore") as f:
-        data = f.read()
-    data = str(data)  # Convert to string for easier functionality
-    raw_games = data.split('[Event')  # Split the data into chess games using the '[Event' string
-    print("Game at 0th index: %s" % raw_games[0])
-    del raw_games[0]  # The first index isn't a game
-    del data  # Remove string to save memory
+def extract_moves_from_pgn(
+    path_in: str | Path,
+    path_out: str | Path,
+    limit: Optional[int] = None,
+    require_eval_annotations: bool = False,
+) -> None:
+    """
+    Convert PGN games into a JSONL dataset of (FEN, move, side_to_move) tuples.
 
-    eval_games = []
-    for game in raw_games:
-        if game.find('eval') != -1:
-            eval_games.append(game)
+    Args:
+        path_in: Source PGN file.
+        path_out: Destination JSONL file.
+        limit: Optional maximum number of games to process.
+        require_eval_annotations: If True, only export games containing [%eval] comments.
+    """
+    path_in = Path(path_in)
+    path_out = Path(path_out)
+    path_out.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"Found {len(eval_games)} games with eval out of {len(raw_games)} total games")
+    processed_games = 0
+    total_positions = 0
 
-    # Now process the filtered games
-    n_games, n_rows = 0, 0
-    with open(path_out, "w", encoding="utf-8") as fout:
-        for game_str in eval_games:
-            # Reconstruct full PGN string
-            full_pgn = '[Event' + game_str
-            game = chess.pgn.read_game(io.StringIO(full_pgn))
+    with path_in.open("r", encoding="utf-8", errors="ignore") as fin, path_out.open("w", encoding="utf-8") as fout:
+        progress = tqdm(desc="processing games", unit="game")
+        while True:
+            game = chess.pgn.read_game(fin)
             if game is None:
-                continue
-            n_games += 1
-            board = game.board()
-            node = game
-            ply = 0
-            while node.variations:
-                next_node = node.variation(0)
-                move = next_node.move
-                fen_before = board.fen()
-                move_uci = move.uci()
-                fout.write(json.dumps({
-                    "fen": fen_before,
-                    "move": move_uci,
-                    "side_to_move": 1 if board.turn else -1
-                }) + "\n")
-                board.push(move)
-                node = next_node
-                ply += 1
-                n_rows += 1
-            if limit and n_games >= limit:
                 break
-    print(f"[OK] {n_games} games, {n_rows} moves → {path_out}")
+            if limit is not None and processed_games >= limit:
+                break
+
+            if require_eval_annotations:
+                game_text = str(game)
+                if "[%eval" not in game_text:
+                    continue
+
+            board = game.board()
+            for move in game.mainline_moves():
+                sample = {
+                    "fen": board.fen(),
+                    "move": move.uci(),
+                    "side_to_move": 1 if board.turn == chess.WHITE else -1,
+                }
+                fout.write(json.dumps(sample) + "\n")
+                board.push(move)
+                total_positions += 1
+
+            processed_games += 1
+            progress.update()
+
+        progress.close()
+
+    print(f"[data_processing] processed {processed_games} games -> {total_positions} positions written to {path_out}")
+
 
 if __name__ == "__main__":
-    # Adjust paths as needed
-    path_in = "data/input/lichess_db_standard_rated_2014-08.pgn"
-    path_out = "data/working/move_dataset.jsonl"
-    os.makedirs("data/working", exist_ok=True)
-    extract_moves_from_pgn(path_in, path_out, limit=100000)
+    INPUT = Path("data/input/lichess_db_standard_rated_2014-08.pgn")
+    OUTPUT = Path("data/working/move_dataset.jsonl")
+    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+    extract_moves_from_pgn(INPUT, OUTPUT, limit=None)
